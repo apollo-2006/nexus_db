@@ -1,5 +1,6 @@
 #include "../include/db.hpp"
 #include "../include/sstable.hpp"
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 
@@ -8,10 +9,50 @@ NexusDB::NexusDB(const std::string& directory) : db_dir(directory) {
     active_memtable = std::make_unique<MemTable>();
     wal = std::make_unique<WriteAheadLog>(db_dir + "/active.wal");
 
-    // In a full implementation, you would recover the WAL here on boot
+    // Re-adopt the SSTables already on disk.
+    //
+    // Without this, reopening a database started from an empty sst_files list:
+    // every previously flushed key read back as "not found", and because
+    // sst_counter also restarted at 0, the next flush wrote data_0.sst straight
+    // over the existing one. Opening an existing database therefore destroyed it.
+    std::vector<std::pair<int, std::string>> found;
+    for (const auto& entry : std::filesystem::directory_iterator(db_dir)) {
+        if (!entry.is_regular_file()) continue;
+
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("data_", 0) != 0 || entry.path().extension() != ".sst") continue;
+
+        // "data_12.sst" -> 12
+        const std::string digits = name.substr(5, name.size() - 5 - 4);
+        if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos) continue;
+
+        try {
+            found.emplace_back(std::stoi(digits), entry.path().string());
+        } catch (const std::exception&) {
+            continue;   // Not one of ours; leave it alone.
+        }
+    }
+
+    // Oldest first, so that get()'s reverse walk still sees newest first.
+    std::sort(found.begin(), found.end());
+    for (const auto& [index, path] : found) {
+        sst_files.push_back(path);
+        sst_counter = std::max(sst_counter, index + 1);
+    }
+
+    if (!sst_files.empty()) {
+        std::cout << "[NexusDB] Recovered " << sst_files.size()
+                  << " SSTable(s) from " << db_dir << "\n";
+    }
+
+    // Still missing: replaying active.wal. Anything written since the last flush
+    // is in that file and is not read back here, so a crash loses it.
 }
 
 NexusDB::~NexusDB() {
+    // Take the same lock put() holds, so a concurrent write cannot be halfway
+    // through the memtable while it is being serialized out.
+    std::lock_guard<std::mutex> lock(db_mutex);
     flush_memtable(); // Safely flush RAM to disk before shutting down
 }
 

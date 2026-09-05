@@ -1,6 +1,12 @@
 # NexusDB
 
-A high-performance embedded key-value store written in C++17, inspired by LevelDB and RocksDB. Features a full-stack interface: a Python/FastAPI REST layer via FFI and a React/TypeScript dashboard for live telemetry.
+An embedded log-structured merge-tree key-value store written in C++17, in the shape of
+LevelDB and RocksDB. Around it: a Python/FastAPI REST layer over the C++ engine via
+`ctypes` FFI, and a React/TypeScript dashboard for live telemetry.
+
+Written to understand why storage engines are built this way — why writes go to a log
+before they go anywhere useful, why on-disk files are immutable, and why deleting a key
+means writing more data rather than less.
 
 ## Stack
 
@@ -14,15 +20,16 @@ A high-performance embedded key-value store written in C++17, inspired by LevelD
 
 Requires: `g++`, Python 3.8+, Node.js/npm.
 
-**Terminal 1 — build the engine:**
+**Terminal 1 — build the engine.** Produces both the `nexus_db` benchmark binary and
+`libnexus.so` for the API to load:
 ```bash
-cd nexus_db
 make clean && make
+./nexus_db          # optional: 100k-write benchmark
 ```
 
 **Terminal 2 — start the API:**
 ```bash
-cd nexus_db/backend
+cd backend
 pip install -r requirements.txt
 uvicorn api:app --reload
 # Listening on http://localhost:8000
@@ -30,20 +37,66 @@ uvicorn api:app --reload
 
 **Terminal 3 — launch the dashboard:**
 ```bash
-cd nexus_db/frontend
+cd frontend
 npm install
 npm run dev
 ```
 
 ## Internals
 
-**MemTable** — Writes land in a probabilistic skip list in RAM, providing O(log n) insertion and point lookup without tree-rebalancing overhead.
+**Why an LSM tree at all.** A B-tree updates records in place, which turns a write into a
+random seek. An LSM tree only ever appends: writes go to memory and are later flushed to
+disk in one sequential pass, trading read complexity for write throughput. That trade is
+the whole design, and everything below follows from it.
 
-**Write-Ahead Log** — Every operation is appended to `active.wal` (unbuffered, O_DIRECT) before touching the MemTable, ensuring durability across crashes.
+**MemTable** — Writes land in a probabilistic skip list in RAM: expected O(log n)
+insertion and point lookup, and it stays sorted without any of the rebalancing a
+tree needs. Sorted order is what makes the eventual flush a single sequential write.
 
-**SSTables** — When the MemTable exceeds 1 MB, it is frozen and flushed to an immutable `.sst` file on disk via a sequential write.
+**Write-Ahead Log** — Every write is appended to `active.wal` before it touches the
+MemTable, so the log records the intent before memory records the effect. `flush()` after
+each append pushes the bytes to the OS, which survives a process crash. It is *not* an
+`fsync`, so a power cut can still lose the tail of the log — and see the limits below,
+because the log is not yet replayed on startup either.
 
-**Tombstones** — Deletes write a `@@TOMBSTONE@@` marker. The key is masked at read time and physically reclaimed during background compaction.
+**SSTables** — When the MemTable passes 1 MB it is serialized to an immutable
+`data_N.sst` file in one sequential pass and a fresh MemTable takes over. Files are never
+modified after they are written, which is what makes reads lock-free against writers and
+compaction a matter of writing a new file rather than editing an old one.
+
+**Reads** — MemTable first, then SSTables from newest to oldest, so a newer value always
+shadows an older one for the same key. Existing files are re-adopted on open, and the
+counter resumes past the highest index found, so reopening a database does not lose or
+overwrite what is already there.
+
+**Tombstones** — A delete writes a `@@TOMBSTONE@@` marker rather than removing anything.
+Because SSTables are immutable, the old value is still sitting in an older file; the
+marker is what makes the newest-first read stop and report "not found". This is why a
+delete in an LSM tree *adds* data.
+
+## Known limits
+
+Where this departs from a real storage engine:
+
+* **The WAL is never replayed.** `active.wal` is written faithfully and cleared on flush,
+  but nothing reads it back at startup. A crash between flushes therefore loses those
+  writes despite the log holding them — the durability mechanism is half-built.
+* **There is no compaction.** SSTables accumulate and are never merged, so tombstoned and
+  overwritten values are never physically reclaimed and the file count grows without
+  bound.
+* **Reads scan SSTables linearly.** No Bloom filter, no index block, no binary search
+  within a file — every lookup byte-walks each file from the start until it finds the key.
+  Reads therefore get steadily slower as files accumulate: in the bundled benchmark, 100k
+  writes finish in ~200 ms while a single miss-then-scan read costs ~330 ms. Bloom filters
+  and a sparse index per file are the first thing this needs.
+* **No range scans or iteration.** Only point `get`. The API layer keeps its own Python
+  set of known keys to fake a key browser, because the engine cannot enumerate.
+* **`@@TOMBSTONE@@` is a magic string, not a flag.** A value that legitimately equals that
+  string would be read back as a deletion.
+* **One global mutex.** Every `put` and `get` serializes on it, so the skip list's
+  concurrency-friendliness is not actually exploited.
+* **`rand()` for skip-list levels.** Unseeded, so the level distribution is identical on
+  every run.
 
 ## WSL2 / Ubuntu
 

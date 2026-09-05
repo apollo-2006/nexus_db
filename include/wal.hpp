@@ -24,7 +24,10 @@ public:
         log_stream.write(key.c_str(), k_len);
         log_stream.write(reinterpret_cast<const char*>(&v_len), sizeof(size_t));
         log_stream.write(value.c_str(), v_len);
-        log_stream.flush(); // Force sync to disk
+        // Pushes the C++ stream buffer into the OS page cache. It is NOT an
+        // fsync: the kernel may still hold these bytes when the machine loses
+        // power, so this survives a process crash but not a hard power cut.
+        log_stream.flush();
     }
 
     void clear() {

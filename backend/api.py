@@ -16,9 +16,13 @@ app.add_middleware(
 )
 
 # --- Load the C++ Shared Library ---
-lib_path = os.path.abspath("../libnexus.so")
+# Resolved relative to this file, not the working directory. os.path.abspath("..")
+# is CWD-relative, so the import blew up unless uvicorn happened to be started
+# from inside backend/.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+lib_path = os.path.join(PROJECT_ROOT, "libnexus.so")
 if not os.path.exists(lib_path):
-    raise RuntimeError(f"Cannot find {lib_path}. Run 'make' in the C++ directory first.")
+    raise RuntimeError(f"Cannot find {lib_path}. Run 'make' in the project root first.")
 
 nexus_lib = ctypes.CDLL(lib_path)
 
@@ -33,8 +37,23 @@ nexus_lib.db_get.restype = ctypes.POINTER(ctypes.c_char)
 
 nexus_lib.db_free_string.argtypes = [ctypes.POINTER(ctypes.c_char)]
 
-# Initialize Database Instance
-db_ptr = nexus_lib.db_create(b"./dashboard_data")
+nexus_lib.db_destroy.argtypes = [ctypes.c_void_p]
+
+# Initialize Database Instance. The data directory is anchored to the project
+# root for the same reason the library path is.
+DATA_DIR = os.path.join(PROJECT_ROOT, "dashboard_data")
+db_ptr = nexus_lib.db_create(DATA_DIR.encode("utf-8"))
+
+
+@app.on_event("shutdown")
+def close_database():
+    """
+    Runs ~NexusDB, which flushes the active memtable to an SSTable.
+
+    Nothing used to call db_destroy, so the destructor never ran and every write
+    since the last automatic flush was lost when the API process exited.
+    """
+    nexus_lib.db_destroy(db_ptr)
 
 # --- Metrics Tracking ---
 metrics = {
