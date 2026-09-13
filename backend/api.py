@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -5,7 +6,17 @@ import ctypes
 import os
 import time
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # Runs ~NexusDB, which flushes the active memtable to an SSTable. Without
+    # this the destructor never ran and every write since the last automatic
+    # flush was lost when the API process exited.
+    nexus_lib.db_destroy(db_ptr)
+
+
+app = FastAPI(lifespan=lifespan)
 
 # Enable CORS for the React frontend
 app.add_middleware(
@@ -45,22 +56,14 @@ DATA_DIR = os.path.join(PROJECT_ROOT, "dashboard_data")
 db_ptr = nexus_lib.db_create(DATA_DIR.encode("utf-8"))
 
 
-@app.on_event("shutdown")
-def close_database():
-    """
-    Runs ~NexusDB, which flushes the active memtable to an SSTable.
-
-    Nothing used to call db_destroy, so the destructor never ran and every write
-    since the last automatic flush was lost when the API process exited.
-    """
-    nexus_lib.db_destroy(db_ptr)
-
 # --- Metrics Tracking ---
 metrics = {
     "total_reads": 0,
     "total_writes": 0,
     "start_time": time.time(),
-    "known_keys": set() # Simulating a key browser since our C++ DB doesn't have an iterator yet
+    # Stands in for a key browser, since the engine cannot iterate yet. A dict
+    # rather than a set: dicts keep insertion order, so "recent" means recent.
+    "known_keys": {},
 }
 
 # --- API Routes ---
@@ -72,10 +75,11 @@ class PutRequest(BaseModel):
 def put_data(req: PutRequest):
     nexus_lib.db_put(db_ptr, req.key.encode('utf-8'), req.value.encode('utf-8'))
     metrics["total_writes"] += 1
-    metrics["known_keys"].add(req.key)
+    metrics["known_keys"].pop(req.key, None)
+    metrics["known_keys"][req.key] = None
     return {"status": "success", "key": req.key}
 
-@app.get("/api/get/{key}")
+@app.get("/api/get/{key:path}")
 def get_data(key: str):
     metrics["total_reads"] += 1
 
@@ -99,5 +103,5 @@ def get_metrics():
         "writes": metrics["total_writes"],
         "keys_tracked": len(metrics["known_keys"]),
         "uptime_seconds": round(uptime, 2),
-        "recent_keys": list(metrics["known_keys"])[-10:] # Return last 10 keys for browser
+        "recent_keys": list(metrics["known_keys"])[-10:][::-1],
     }
