@@ -3,8 +3,16 @@ import { Database, Activity, HardDrive, Search, Zap, Send } from 'lucide-react';
 
 const API_BASE = "http://localhost:8000/api";
 
+interface Metrics {
+    reads: number;
+    writes: number;
+    keys_tracked: number;
+    uptime_seconds: number;
+    recent_keys: string[];
+}
+
 export default function Dashboard() {
-    const [metrics, setMetrics] = useState({ reads: 0, writes: 0, keys_tracked: 0, uptime_seconds: 0, recent_keys: [] });
+    const [metrics, setMetrics] = useState<Metrics>({ reads: 0, writes: 0, keys_tracked: 0, uptime_seconds: 0, recent_keys: [] });
     const [queryKey, setQueryKey] = useState("");
     const [queryResult, setQueryResult] = useState<any>(null);
     const [insertKey, setInsertKey] = useState("");
@@ -15,7 +23,7 @@ export default function Dashboard() {
             fetch(`${API_BASE}/metrics`)
                 .then(res => res.json())
                 .then(data => setMetrics(data))
-                .catch(err => console.error("API Offline"));
+                .catch(() => console.error("API Offline"));
         };
         fetchMetrics();
         const interval = setInterval(fetchMetrics, 1000);
@@ -25,7 +33,7 @@ export default function Dashboard() {
     const handleQuery = async (e: React.FormEvent) => {
         e.preventDefault();
         try {
-            const res = await fetch(`${API_BASE}/get/${queryKey}`);
+            const res = await fetch(`${API_BASE}/get/${encodeURIComponent(queryKey)}`);
             if (res.ok) {
                 const data = await res.json();
                 setQueryResult(data);
@@ -126,8 +134,8 @@ export default function Dashboard() {
                         {metrics.recent_keys.length === 0 ? (
                             <p className="text-neutral-500 italic text-sm">No keys inserted yet.</p>
                         ) : (
-                            metrics.recent_keys.map((k: string, i: number) => (
-                                <div key={i} onClick={() => setQueryKey(k)} className="bg-neutral-950 border border-neutral-800 px-4 py-2 rounded-lg text-sm font-mono hover:border-emerald-500 cursor-pointer transition-colors flex justify-between items-center">
+                            metrics.recent_keys.map(k => (
+                                <div key={k} onClick={() => setQueryKey(k)} className="bg-neutral-950 border border-neutral-800 px-4 py-2 rounded-lg text-sm font-mono hover:border-emerald-500 cursor-pointer transition-colors flex justify-between items-center">
                                     <span className="text-neutral-300">{k}</span>
                                     <span className="text-xs text-neutral-600 text-right">Click to query</span>
                                 </div>
@@ -150,4 +158,4 @@ const MetricCard = ({ icon, title, value, color }: any) => (
             <p className="text-2xl font-bold text-white">{value}</p>
         </div>
     </div>
-);
+);
