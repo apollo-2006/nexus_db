@@ -3,6 +3,7 @@
 #include <vector>
 #include <optional>
 #include <random>
+#include <utility>
 
 class MemTable {
 private:
@@ -10,18 +11,20 @@ private:
         std::string key;
         std::string value;
         std::vector<Node*> forward;
-        Node(std::string k, std::string v, int level) : key(k), value(v), forward(level, nullptr) {}
+        Node(std::string k, std::string v, int level) : key(std::move(k)), value(std::move(v)), forward(level, nullptr) {}
     };
 
-    const int MAX_LEVEL = 16;
-    const float P = 0.5;
+    static constexpr int MAX_LEVEL = 16;
+    static constexpr double P = 0.5;
     int current_level;
     Node* head;
     size_t current_byte_size;
+    std::mt19937 rng{std::random_device{}()};
+    std::bernoulli_distribution coin{P};
 
     int random_level() {
         int lvl = 1;
-        while (((float)rand() / RAND_MAX) < P && lvl < MAX_LEVEL) {
+        while (coin(rng) && lvl < MAX_LEVEL) {
             lvl++;
         }
         return lvl;
@@ -31,6 +34,9 @@ public:
     MemTable() : current_level(1), current_byte_size(0) {
         head = new Node("", "", MAX_LEVEL);
     }
+
+    MemTable(const MemTable&) = delete;
+    MemTable& operator=(const MemTable&) = delete;
 
     ~MemTable() {
         Node* curr = head;
@@ -103,4 +109,4 @@ public:
     }
 
     size_t byte_size() const { return current_byte_size; }
-};
+};

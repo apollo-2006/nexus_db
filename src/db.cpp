@@ -78,7 +78,14 @@ void NexusDB::flush_memtable() {
 
     // Extract sorted data and write to disk
     auto data = active_memtable->get_all_sorted();
-    SSTable::write(sst_path, data);
+    if (!SSTable::write(sst_path, data)) {
+        // Keep the memtable and the WAL. Clearing the log after a failed write
+        // would drop every record in this memtable with nothing left holding it.
+        std::cerr << "[NexusDB] Flush to " << sst_path << " failed; keeping memtable\n";
+        std::filesystem::remove(sst_path);
+        --sst_counter;
+        return;
+    }
 
     sst_files.push_back(sst_path);
 
