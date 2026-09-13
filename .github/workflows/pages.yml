@@ -1,0 +1,42 @@
+name: demo
+
+# Builds the WebAssembly demo from this commit's sources and publishes it to
+# GitHub Pages, so the live demo always runs the code in the repository.
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'include/**', 'tests/**', 'web/**', 'Makefile', '.github/workflows/pages.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the engine
+        run: make test
+      - uses: mymindstorm/setup-emsdk@v14
+      - name: Build demo
+        run: web/build.sh
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -2,12 +2,15 @@
 #include "../include/sstable.hpp"
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 
-NexusDB::NexusDB(const std::string& directory) : db_dir(directory) {
+static const std::string TOMBSTONE = "@@TOMBSTONE@@";
+
+NexusDB::NexusDB(const std::string& directory, size_t limit)
+    : db_dir(directory), memtable_limit(limit) {
     std::filesystem::create_directories(db_dir);
     active_memtable = std::make_unique<MemTable>();
-    wal = std::make_unique<WriteAheadLog>(db_dir + "/active.wal");
 
     // Re-adopt the SSTables already on disk.
     //
@@ -45,8 +48,59 @@ NexusDB::NexusDB(const std::string& directory) : db_dir(directory) {
                   << " SSTable(s) from " << db_dir << "\n";
     }
 
-    // Still missing: replaying active.wal. Anything written since the last flush
-    // is in that file and is not read back here, so a crash loses it.
+    // Replay the write-ahead log. Everything written since the last flush is in
+    // active.wal and nowhere else, so this is what makes a crash lose nothing that
+    // reached the log. The log is opened for appending only afterwards, once any
+    // torn tail from the crash has been cut off.
+    const std::string wal_path = db_dir + "/active.wal";
+    replayed_records = replay_wal(wal_path);
+    wal = std::make_unique<WriteAheadLog>(wal_path);
+
+    if (replayed_records > 0) {
+        std::cout << "[NexusDB] Replayed " << replayed_records << " WAL record(s)\n";
+    }
+}
+
+size_t NexusDB::replay_wal(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) return 0;
+
+    in.seekg(0, std::ios::end);
+    const std::streamoff file_size = in.tellg();
+    in.seekg(0, std::ios::beg);
+
+    // Records are [key_len][key][value_len][value], the format WriteAheadLog
+    // appends. good_end is the offset just past the last complete record.
+    std::streamoff good_end = 0;
+    size_t records = 0;
+    for (;;) {
+        size_t k_len, v_len;
+        if (!in.read(reinterpret_cast<char*>(&k_len), sizeof(size_t))) break;
+        if (k_len > static_cast<size_t>(file_size - in.tellg())) break;
+        std::string key(k_len, '\0');
+        if (k_len && !in.read(&key[0], k_len)) break;
+        if (!in.read(reinterpret_cast<char*>(&v_len), sizeof(size_t))) break;
+        if (v_len > static_cast<size_t>(file_size - in.tellg())) break;
+        std::string value(v_len, '\0');
+        if (v_len && !in.read(&value[0], v_len)) break;
+
+        // Straight into the memtable: these records are already in the log.
+        active_memtable->put(key, value);
+        good_end = in.tellg();
+        records++;
+    }
+    in.close();
+
+    // A crash mid-append leaves a partial record at the end. Cut it off, or every
+    // record appended after this open would sit behind it where replay cannot reach.
+    if (good_end < file_size) {
+        std::cout << "[NexusDB] Truncating " << (file_size - good_end)
+                  << " byte(s) of torn WAL tail\n";
+        std::filesystem::resize_file(path, static_cast<std::uintmax_t>(good_end));
+    }
+
+    // If the replayed memtable is already over the limit, the next put flushes it.
+    return records;
 }
 
 NexusDB::~NexusDB() {
@@ -98,27 +152,53 @@ void NexusDB::flush_memtable() {
 
 std::optional<std::string> NexusDB::get(const std::string& key) {
     std::lock_guard<std::mutex> lock(db_mutex);
+    return get_traced_locked(key).value;
+}
+
+NexusDB::ReadTrace NexusDB::get_traced(const std::string& key) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+    return get_traced_locked(key);
+}
+
+NexusDB::ReadTrace NexusDB::get_traced_locked(const std::string& key) {
+    ReadTrace trace;
 
     // 1. Check RAM (MemTable) first
     auto val = active_memtable->get(key);
     if (val) {
-        if (*val == "@@TOMBSTONE@@") return std::nullopt; // Handle deleted keys
-        return val;
+        trace.source = -1;
+        if (*val == TOMBSTONE) trace.tombstone = true;  // deleted: stop, report a miss
+        else trace.value = std::move(val);
+        return trace;
     }
 
     // 2. Search Disk (SSTables) from newest to oldest
-    for (auto it = sst_files.rbegin(); it != sst_files.rend(); ++it) {
+    int position = 0;
+    for (auto it = sst_files.rbegin(); it != sst_files.rend(); ++it, ++position) {
+        trace.sstables_checked++;
         val = SSTable::search(*it, key);
         if (val) {
-            if (*val == "@@TOMBSTONE@@") return std::nullopt;
-            return val;
+            trace.source = position;
+            if (*val == TOMBSTONE) trace.tombstone = true;
+            else trace.value = std::move(val);
+            return trace;
         }
     }
 
-    return std::nullopt;
+    return trace;
 }
 
 void NexusDB::remove(const std::string& key) {
     // Delete is just a write with a special Tombstone marker
-    put(key, "@@TOMBSTONE@@");
+    put(key, TOMBSTONE);
+}
+
+size_t NexusDB::sstable_count() {
+    std::lock_guard<std::mutex> lock(db_mutex);
+    return sst_files.size();
+}
+
+size_t NexusDB::memtable_bytes() {
+    std::lock_guard<std::mutex> lock(db_mutex);
+    return active_memtable->byte_size();
 }

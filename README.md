@@ -1,5 +1,13 @@
 # NexusDB
 
+[![demo](https://github.com/apollo-2006/nexus_db/actions/workflows/pages.yml/badge.svg)](https://github.com/apollo-2006/nexus_db/actions/workflows/pages.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+**[Crash it in your browser →](https://apollo-2006.github.io/nexus_db/)** The engine is
+compiled to WebAssembly and writes a real WAL and real SSTables into an in-memory
+filesystem. Write until the memtable flushes, trace a read through the files, decode an
+SSTable, then kill the database without a clean shutdown and watch the log replay.
+
 An embedded log-structured merge-tree key-value store written in C++17, in the shape of
 LevelDB and RocksDB. Around it: a Python/FastAPI REST layer over the C++ engine via
 `ctypes` FFI, and a React/TypeScript dashboard for live telemetry.
@@ -56,8 +64,14 @@ tree needs. Sorted order is what makes the eventual flush a single sequential wr
 **Write-Ahead Log**: Every write is appended to `active.wal` before it touches the
 MemTable, so the log records the intent before memory records the effect. `flush()` after
 each append pushes the bytes to the OS, which survives a process crash. It is *not* an
-`fsync`, so a power cut can still lose the tail of the log. See also the limits below,
-because the log is not yet replayed on startup either.
+`fsync`, so a power cut can still lose the tail of the log.
+
+**Recovery**: Opening a database replays `active.wal` into a fresh MemTable, so a crash
+between flushes loses nothing that reached the log. A crash in the middle of an append
+leaves a partial record at the end of the file; replay stops at the last complete record
+and truncates the rest, because a torn tail left in place would sit in front of every
+record appended after it, where the next replay could never reach them. Lengths are
+bounded by the bytes actually left in the file, so a corrupt length is never allocated.
 
 **SSTables**: When the MemTable passes 1 MB it is serialized to an immutable
 `data_N.sst` file in one sequential pass and a fresh MemTable takes over. Files are never
@@ -78,9 +92,6 @@ delete in an LSM tree *adds* data.
 
 Where this departs from a real storage engine:
 
-* **The WAL is never replayed.** `active.wal` is written faithfully and cleared on flush,
-  but nothing reads it back at startup. A crash between flushes therefore loses those
-  writes despite the log holding them: the durability mechanism is half-built.
 * **There is no compaction.** SSTables accumulate and are never merged, so tombstoned and
   overwritten values are never physically reclaimed and the file count grows without
   bound.
@@ -89,11 +100,38 @@ Where this departs from a real storage engine:
   miss therefore costs a pass over every byte on disk, about 50 ms at 67 MB (see
   Benchmarks). Bloom filters and a sparse index per file are the first thing this needs.
 * **No range scans or iteration.** Only point `get`. The API layer keeps its own Python
-  set of known keys to fake a key browser, because the engine cannot enumerate.
+  record of written keys to fake a key browser, because the engine cannot enumerate.
 * **`@@TOMBSTONE@@` is a magic string, not a flag.** A value that legitimately equals that
   string would be read back as a deletion.
 * **One global mutex.** Every `put` and `get` serializes on it, so the skip list's
   concurrency-friendliness is not actually exploited.
+
+## Tests
+
+```bash
+make test
+```
+
+`tests/test_db.cpp` builds with AddressSanitizer and UndefinedBehaviorSanitizer and covers
+overwrites, tombstones shadowing older files, re-adopting SSTables on reopen, and the
+recovery paths. The crash tests fork a child that writes and then `_exit()`s, skipping
+every destructor, so the parent can only read back what the WAL preserved: unflushed puts
+and deletes, a crash after several flushes, a torn final record, writes appended after a
+torn tail, and a log that starts with a garbage length.
+
+## Web demo
+
+`web/db_web.cpp` wraps `NexusDB` for JavaScript and `web/build.sh` compiles it with the
+unmodified engine using Emscripten, backed by its in-memory filesystem. GitHub Actions
+runs `make test`, builds the demo, and publishes it to Pages on every push to `main`.
+
+```bash
+web/build.sh                          # needs em++ on PATH
+python3 -m http.server -d web/dist    # then open http://localhost:8000
+```
+
+The FastAPI and React dashboard in `backend/` and `frontend/` is the local way to drive the
+engine; the web demo replaces the HTTP hop with direct WebAssembly calls.
 
 ## Benchmarks
 
@@ -120,6 +158,10 @@ a seek to end of file and back, and skipped values with `seekg`, which discards 
 `ifstream` buffer. Both turned every record into syscalls. Computing the file size once
 and skipping with `ignore()` took a missing-key read from **4.53 s to 50 ms** on the
 same run.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 ## WSL2 / Ubuntu
 

@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nexus_db · an LSM tree in the browser</title>
+  <meta name="description" content="Write, read, flush, crash and recover an LSM-tree key-value store written in C++, compiled to WebAssembly.">
+  <link rel="stylesheet" href="demo.css">
+  <style>
+    .meter { height: 10px; background: var(--bg-sunk); border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+    .meter div { height: 100%; background: var(--accent); transition: width .15s; }
+    .files { list-style: none; margin: 0; padding: 0; font-family: var(--font-mono); font-size: 0.8rem; }
+    .files li { display: flex; justify-content: space-between; gap: 8px; padding: 4px 8px; border-radius: 4px; cursor: pointer; border: 1px solid transparent; }
+    .files li:hover { border-color: var(--line); }
+    .files li.sel { border-color: var(--accent-edge); background: var(--accent-soft); }
+    .files li.hit { border-color: var(--ok); }
+    .files li.wal { color: var(--accent-warm); }
+    .trace { font-family: var(--font-mono); font-size: 0.85rem; min-height: 3em; }
+    .kv { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; }
+    @media (max-width: 520px) { .kv { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header class="masthead">
+    <div>
+      <p class="eyebrow">nexus_db · C++17 compiled to WebAssembly</p>
+      <h1>An LSM tree you can crash</h1>
+      <p class="lede">The real storage engine from <span class="mono">src/db.cpp</span>, writing a real write-ahead log and real
+        SSTable files into an in-memory filesystem. Write until the memtable flushes, read keys back through the files, then
+        crash it without a clean shutdown and watch the log bring the writes back.</p>
+    </div>
+    <nav class="links">
+      <a href="https://github.com/apollo-2006/nexus_db">source</a>
+      <a href="https://abirdeol.tech/research/tombstones">post-mortem</a>
+    </nav>
+  </header>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>Write</h2>
+      <div class="kv" style="margin-bottom:8px">
+        <input id="k" type="text" value="user:42" aria-label="key">
+        <input id="v" type="text" value="{&quot;tier&quot;:&quot;gold&quot;}" aria-label="value">
+        <button id="put">put</button>
+      </div>
+      <div class="row" style="margin-bottom:12px">
+        <button id="del" class="ghost">delete key</button>
+        <button id="bulk" class="ghost">put 500 keys</button>
+        <button id="bulk5k" class="ghost">put 5,000 keys</button>
+      </div>
+      <h2>Read</h2>
+      <div class="row" style="margin-bottom:8px">
+        <input id="rk" type="text" value="user:42" style="flex:1" aria-label="key to read">
+        <button id="get">get</button>
+      </div>
+      <p class="trace" id="trace"></p>
+    </section>
+
+    <section class="panel">
+      <h2>Memtable</h2>
+      <div class="row" style="justify-content:space-between;margin-bottom:6px">
+        <span class="small mono" id="memText"></span>
+        <label class="small muted">flush at
+          <select id="limit">
+            <option value="4096">4 KB</option>
+            <option value="16384" selected>16 KB</option>
+            <option value="65536">64 KB</option>
+            <option value="1048576">1 MB (default)</option>
+          </select>
+        </label>
+      </div>
+      <div class="meter"><div id="mem"></div></div>
+      <p class="small muted" style="margin:6px 0 14px">The flush threshold is a constructor argument; changing it reopens the database.</p>
+
+      <h2>Lifecycle</h2>
+      <div class="row" style="margin-bottom:8px">
+        <button id="reopen" class="ghost">close &amp; reopen</button>
+        <button id="crash" class="warm">crash &amp; reopen</button>
+        <button id="wipe" class="ghost">wipe</button>
+      </div>
+      <pre class="log" id="log" style="max-height:170px"></pre>
+    </section>
+
+    <section class="panel">
+      <h2>On disk <span class="muted mono" id="diskTotal"></span></h2>
+      <ul class="files" id="files"></ul>
+      <p class="small muted" style="margin:8px 0 0">Newest first, the order a read searches them. Click a file to decode it.</p>
+    </section>
+
+    <section class="panel wide">
+      <h2>Inside <span class="mono" id="inspName">a file</span></h2>
+      <p class="small muted" id="inspNote" style="margin:0 0 8px"></p>
+      <div class="table-wrap" style="max-height:260px;overflow:auto">
+        <table><thead><tr><th>#</th><th>key</th><th>value</th></tr></thead><tbody id="insp"></tbody></table>
+      </div>
+    </section>
+
+    <section class="panel wide">
+      <h2>Benchmark, inside WebAssembly</h2>
+      <p class="small muted" style="margin:0 0 10px">Sequential writes into a fresh database with the default 1 MB memtable, then mean
+        latency of point reads. The same shape as <span class="mono">./nexus_db</span> natively, where the README has the numbers. Disk reads
+        here are slower than native ones: every file read goes through Emscripten's JavaScript filesystem layer rather than the kernel.</p>
+      <div class="row" style="margin-bottom:10px">
+        <select id="bw"><option value="100000">100k writes</option><option value="300000" selected>300k writes</option></select>
+        <button id="bench">run</button>
+      </div>
+      <div class="table-wrap"><table><tbody id="bres"></tbody></table></div>
+    </section>
+  </div>
+
+  <footer>nexus_db by <a href="https://abirdeol.tech">Abir Deol</a></footer>
+</div>
+<script src="nexus_db.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
