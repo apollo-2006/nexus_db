@@ -8,7 +8,7 @@ em++ -std=c++17 -O2 -fexceptions -Wall -Wextra -I../include \
   ../src/db.cpp db_web.cpp \
   -fexceptions -sMODULARIZE=1 -sEXPORT_NAME=NexusDB -sENVIRONMENT=web \
   -sFORCE_FILESYSTEM=1 -sEXPORTED_RUNTIME_METHODS=FS,ccall,cwrap,UTF8ToString \
-  -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=67108864 \
+  -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=16777216 \
   -o dist/nexus_db.js
-cp index.html app.js demo.css dist/
+cp index.html app.js demo.css og.jpg dist/
 echo "built web/dist"

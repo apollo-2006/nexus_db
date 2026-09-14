@@ -160,11 +160,13 @@ NexusDB({ print: (t) => log(t.replace(/^\[NexusDB\] /, ''), 'muted'), printErr: 
   $('limit').onchange = () => { api.close(); limit = Number($('limit').value); open(`reopened with a ${fmt(limit)} flush threshold`); };
 
   $('bench').onclick = async () => {
-    $('bench').disabled = true;
+    const buttons = [...document.querySelectorAll('button')];
+    buttons.forEach((b) => { b.disabled = true; });
     $('bres').innerHTML = '<tr><td class="muted">running…</td></tr>';
     await new Promise((r) => setTimeout(r, 30));
     const writes = Number($('bw').value);
-    M._bench_run(writes, 40);
+    M._bench_run(writes, 20);
+    buttons.forEach((b) => { b.disabled = false; });
     const r = (i) => M._bench_result(i);
     const ms = (us) => (us >= 1000 ? (us / 1000).toFixed(1) + ' ms' : us >= 1 ? us.toFixed(1) + ' µs' : '< 1 µs (below the browser clock)');
     $('bres').innerHTML = [
@@ -174,6 +176,5 @@ NexusDB({ print: (t) => log(t.replace(/^\[NexusDB\] /, ''), 'muted'), printErr: 
       ['read: oldest key (last file)', ms(r(4))],
       ['read: missing key (every file)', ms(r(5))],
     ].map(([a, b]) => `<tr><td>${a}</td><td>${b}</td></tr>`).join('');
-    $('bench').disabled = false;
   };
 });
