@@ -7,6 +7,7 @@
 #include <iostream>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 // Benchmark: sequential writes, then point reads against keys that live in the
@@ -125,6 +126,27 @@ int main(int argc, char** argv) {
     // filters actually have to answer, so both are worth separating.
     time_reads("missing, outside range", [&] { return std::string("nope_") + std::to_string(rng()); }, false);
     time_reads("missing, inside range", [&] { return keys[any(rng)] + "_absent"; }, false);
+
+    // A read holds the lock only while it looks at the memtables and takes
+    // references to the files it will search, so reads of different keys do not
+    // wait for each other.
+    std::printf("concurrent reads, random existing keys:\n");
+    for (int threads : {1, 2, 4, 8}) {
+        const int per_thread = 20000;
+        std::vector<std::thread> workers;
+        const auto start = Clock::now();
+        for (int t = 0; t < threads; t++) {
+            workers.emplace_back([&, t] {
+                std::mt19937 local(static_cast<unsigned>(t) + 1);
+                std::uniform_int_distribution<int> pick(0, num_writes - 1);
+                for (int i = 0; i < per_thread; i++) db.get(keys[pick(local)]);
+            });
+        }
+        for (auto& worker : workers) worker.join();
+        const double seconds = us_since(start) / 1e6;
+        std::printf("  %d thread%s %s%9.0f reads/s\n", threads, threads == 1 ? " " : "s",
+                    threads < 10 ? " " : "", threads * per_thread / seconds);
+    }
 
     return 0;
 }

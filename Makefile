@@ -28,7 +28,7 @@ $(OBJ_DIR):
 
 # Engine tests, built with ASan and UBSan. Engine log lines are filtered out.
 test: tests/test_db.cpp src/db.cpp
-	$(CXX) -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra $(INCLUDES) $^ -o test_db
+	$(CXX) -std=c++17 -O1 -g -pthread -fsanitize=address,undefined -Wall -Wextra $(INCLUDES) $^ -o test_db
 	./test_db | grep -v '^\[NexusDB\]'
 
 -include $(OBJS:.o=.d)
@@ -36,4 +36,4 @@ test: tests/test_db.cpp src/db.cpp
 clean:
 	rm -rf $(OBJ_DIR) $(TARGET) $(LIB_TARGET) test_db test_db_data bench_db_data dashboard_data
 
-.PHONY: all clean test
+.PHONY: all clean test

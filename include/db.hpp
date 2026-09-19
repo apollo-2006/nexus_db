@@ -4,6 +4,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -94,7 +95,10 @@ public:
 private:
     void open(const std::string& directory);
     void write(const std::string& key, const std::string& value, bool tombstone);
-    ReadTrace get_traced_locked(const std::string& key);
+    // Answers from the memtables if it can, and otherwise hands back the files
+    // to search, in order. Caller holds at least a shared lock.
+    bool read_memtables_locked(const std::string& key, ReadTrace& trace) const;
+    std::vector<SSTableFilePtr> search_order_locked(const std::string& key) const;
 
     // Recovery.
     void load_manifest();
@@ -103,13 +107,13 @@ private:
     void write_manifest_locked();
 
     // The write path.
-    void rotate_memtable_locked(std::unique_lock<std::mutex>& lock);
+    void rotate_memtable_locked(std::unique_lock<std::shared_mutex>& lock);
     std::string wal_path(uint64_t seq) const;
     std::string sst_path(uint64_t seq) const;
 
     // The worker, and the two jobs it runs.
     void background_loop();
-    void flush_immutable_locked(std::unique_lock<std::mutex>& lock);
+    void flush_immutable_locked(std::unique_lock<std::shared_mutex>& lock);
     struct LevelStats {
         uint64_t bytes = 0;
         uint64_t records = 0;
@@ -119,15 +123,18 @@ private:
     int deepest_level_locked() const;
     bool level_wants_compaction_locked(int level) const;
     bool compaction_needed_locked() const;
-    void compact_once_locked(std::unique_lock<std::mutex>& lock);
+    void compact_once_locked(std::unique_lock<std::shared_mutex>& lock);
     uint64_t level_budget(int level) const;
 
     std::string db_dir_;
     Options options_;
 
-    mutable std::mutex mu_;
-    std::condition_variable work_cv_;   // worker: there is something to do
-    std::condition_variable idle_cv_;   // writers and waiters: the worker finished
+    // Readers take this shared and hold it only long enough to look at the
+    // memtables and take a reference to the files they will search. Writers and
+    // the worker take it exclusively, and drop it while they do file I/O.
+    mutable std::shared_mutex mu_;
+    std::condition_variable_any work_cv_;   // worker: there is something to do
+    std::condition_variable_any idle_cv_;   // writers and waiters: the worker finished
 
     std::unique_ptr<MemTable> active_;
     std::unique_ptr<MemTable> immutable_;   // handed to the flusher, still readable

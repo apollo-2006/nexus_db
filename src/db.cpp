@@ -71,14 +71,14 @@ void NexusDB::open(const std::string& directory) {
 
 NexusDB::~NexusDB() {
     {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::unique_lock<std::shared_mutex> lock(mu_);
         shutdown_ = true;
     }
     work_cv_.notify_all();
     idle_cv_.notify_all();
     if (worker_.joinable()) worker_.join();
 
-    std::unique_lock<std::mutex> lock(mu_);
+    std::unique_lock<std::shared_mutex> lock(mu_);
     // Whatever the worker did not reach. A clean close leaves nothing that only
     // a log holds, which is what the reopen tests rely on.
     if (immutable_) flush_immutable_locked(lock);
@@ -300,7 +300,7 @@ void NexusDB::remove(const std::string& key) {
 }
 
 void NexusDB::write(const std::string& key, const std::string& value, bool tombstone) {
-    std::unique_lock<std::mutex> lock(mu_);
+    std::unique_lock<std::shared_mutex> lock(mu_);
 
     wal_->append(key, value, tombstone);
     active_->put(key, value, tombstone);
@@ -308,7 +308,7 @@ void NexusDB::write(const std::string& key, const std::string& value, bool tombs
     if (active_->byte_size() >= options_.memtable_limit) rotate_memtable_locked(lock);
 }
 
-void NexusDB::rotate_memtable_locked(std::unique_lock<std::mutex>& lock) {
+void NexusDB::rotate_memtable_locked(std::unique_lock<std::shared_mutex>& lock) {
     if (options_.background) {
         // One memtable may be waiting to be flushed. A second would mean writes
         // are outrunning the flusher, so the writer waits here rather than
@@ -337,19 +337,49 @@ void NexusDB::rotate_memtable_locked(std::unique_lock<std::mutex>& lock) {
 
 // -------------------------------------------------------------- read path
 
-std::optional<std::string> NexusDB::get(const std::string& key) {
-    std::unique_lock<std::mutex> lock(mu_);
-    return get_traced_locked(key).value;
-}
+std::optional<std::string> NexusDB::get(const std::string& key) { return get_traced(key).value; }
 
 NexusDB::ReadTrace NexusDB::get_traced(const std::string& key) {
-    std::unique_lock<std::mutex> lock(mu_);
-    return get_traced_locked(key);
+    ReadTrace trace;
+    std::vector<SSTableFilePtr> files;
+    {
+        // The lock is held for the memtable lookup and for taking a reference to
+        // the files to search, and released before any of them is opened. A read
+        // that has to go to disk therefore blocks neither writers nor each other.
+        std::shared_lock<std::shared_mutex> lock(mu_);
+        if (read_memtables_locked(key, trace)) return trace;
+        files = search_order_locked(key);
+    }
+
+    // Holding a reference is what makes this safe: a compaction may retire any
+    // of these files while the search is inside them, and the file is removed
+    // from disk only once the last reference to it is gone.
+    int position = 0;
+    for (const auto& file : files) {
+        // A file whose key range or Bloom filter rules the key out is never
+        // opened, which is what keeps a miss from costing a pass over the tree.
+        if (!file->reader.may_hold(key)) {
+            trace.sstables_skipped++;
+            position++;
+            continue;
+        }
+        trace.sstables_checked++;
+        auto record = file->reader.get(key);
+        if (record) {
+            trace.source = position;
+            trace.level = file->level;
+            trace.file = fs::path(file->reader.path()).filename().string();
+            trace.tombstone = record->tombstone;
+            if (!record->tombstone) trace.value = std::move(record->value);
+            return trace;
+        }
+        position++;
+    }
+
+    return trace;
 }
 
-NexusDB::ReadTrace NexusDB::get_traced_locked(const std::string& key) {
-    ReadTrace trace;
-
+bool NexusDB::read_memtables_locked(const std::string& key, ReadTrace& trace) const {
     // The memtables hold the newest version of anything written since the last
     // flush, so a hit there ends the search whether it is a value or a deletion.
     for (const MemTable* table : {active_.get(), immutable_.get()}) {
@@ -358,55 +388,38 @@ NexusDB::ReadTrace NexusDB::get_traced_locked(const std::string& key) {
             trace.source = -1;
             trace.tombstone = entry->tombstone;
             if (!entry->tombstone) trace.value = std::move(entry->value);
-            return trace;
+            return true;
         }
     }
+    return false;
+}
 
-    int position = 0;
-    const auto consult = [&](const SSTableFilePtr& file) {
-        position++;
-        // A file whose key range or Bloom filter rules the key out is never
-        // opened, which is what keeps a miss from costing a pass over the tree.
-        if (!file->reader.may_hold(key)) {
-            trace.sstables_skipped++;
-            return false;
-        }
-        trace.sstables_checked++;
-        auto record = file->reader.get(key);
-        if (!record) return false;
+std::vector<SSTableFilePtr> NexusDB::search_order_locked(const std::string& key) const {
+    std::vector<SSTableFilePtr> files;
 
-        trace.source = position - 1;
-        trace.level = file->level;
-        trace.file = fs::path(file->reader.path()).filename().string();
-        trace.tombstone = record->tombstone;
-        if (!record->tombstone) trace.value = std::move(record->value);
-        return true;
-    };
+    // Level 0 files overlap, so any of them can hold the key and the newest has
+    // to be consulted first.
+    files.insert(files.end(), levels_[0].rbegin(), levels_[0].rend());
 
-    // Level 0 files overlap, so every one of them can hold the key and the
-    // newest has to be consulted first.
-    for (auto it = levels_[0].rbegin(); it != levels_[0].rend(); ++it) {
-        if (consult(*it)) return trace;
-    }
-
-    // Below that the files of a level are disjoint, so at most one can hold it.
+    // Below that a level is disjoint, so at most one of its files can hold it.
     for (size_t level = 1; level < levels_.size(); level++) {
-        const auto& files = levels_[level];
-        auto it = std::upper_bound(files.begin(), files.end(), key,
-                                   [](const std::string& k, const SSTableFilePtr& f) { return k < f->reader.min_key(); });
-        if (it == files.begin()) continue;
+        const auto& candidates = levels_[level];
+        auto it = std::upper_bound(
+            candidates.begin(), candidates.end(), key,
+            [](const std::string& k, const SSTableFilePtr& f) { return k < f->reader.min_key(); });
+        if (it == candidates.begin()) continue;
         --it;
         if (key > (*it)->reader.max_key()) continue;
-        if (consult(*it)) return trace;
+        files.push_back(*it);
     }
 
-    return trace;
+    return files;
 }
 
 // --------------------------------------------------------- the background
 
 void NexusDB::background_loop() {
-    std::unique_lock<std::mutex> lock(mu_);
+    std::unique_lock<std::shared_mutex> lock(mu_);
     for (;;) {
         worker_idle_ = true;
         idle_cv_.notify_all();
@@ -422,7 +435,7 @@ void NexusDB::background_loop() {
     }
 }
 
-void NexusDB::flush_immutable_locked(std::unique_lock<std::mutex>& lock) {
+void NexusDB::flush_immutable_locked(std::unique_lock<std::shared_mutex>& lock) {
     if (!immutable_ || immutable_->byte_size() == 0) {
         immutable_.reset();
         idle_cv_.notify_all();
@@ -517,7 +530,7 @@ bool NexusDB::compaction_needed_locked() const {
     return false;
 }
 
-void NexusDB::compact_once_locked(std::unique_lock<std::mutex>& lock) {
+void NexusDB::compact_once_locked(std::unique_lock<std::shared_mutex>& lock) {
     // Which level is over its budget by the most. Level 0 is counted in files
     // rather than bytes, because what makes it expensive is that a read has to
     // consult every one of them.
@@ -697,7 +710,7 @@ void NexusDB::compact_once_locked(std::unique_lock<std::mutex>& lock) {
 }
 
 void NexusDB::wait_for_background() {
-    std::unique_lock<std::mutex> lock(mu_);
+    std::unique_lock<std::shared_mutex> lock(mu_);
     if (!options_.background) return;
     idle_cv_.wait(lock, [&] {
         return shutdown_ || (worker_idle_ && immutable_ == nullptr && !compaction_needed_locked());
@@ -707,19 +720,19 @@ void NexusDB::wait_for_background() {
 // ------------------------------------------------------------------ stats
 
 size_t NexusDB::sstable_count() {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::shared_lock<std::shared_mutex> lock(mu_);
     size_t total = 0;
     for (const auto& level : levels_) total += level.size();
     return total;
 }
 
 size_t NexusDB::memtable_bytes() {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::shared_lock<std::shared_mutex> lock(mu_);
     return active_->byte_size() + (immutable_ ? immutable_->byte_size() : 0);
 }
 
 int NexusDB::level_count() {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::shared_lock<std::shared_mutex> lock(mu_);
     int highest = 0;
     for (size_t level = 0; level < levels_.size(); level++)
         if (!levels_[level].empty()) highest = static_cast<int>(level);
@@ -727,13 +740,13 @@ int NexusDB::level_count() {
 }
 
 size_t NexusDB::files_in_level(int level) {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::shared_lock<std::shared_mutex> lock(mu_);
     if (level < 0 || level >= static_cast<int>(levels_.size())) return 0;
     return levels_[static_cast<size_t>(level)].size();
 }
 
 uint64_t NexusDB::bytes_in_level(int level) {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::shared_lock<std::shared_mutex> lock(mu_);
     if (level < 0 || level >= static_cast<int>(levels_.size())) return 0;
     uint64_t bytes = 0;
     for (const auto& file : levels_[static_cast<size_t>(level)]) bytes += file->reader.file_bytes();

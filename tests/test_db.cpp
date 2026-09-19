@@ -6,10 +6,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <string>
+#include <thread>
 
 #include "../include/bloom.hpp"
 #include "../include/db.hpp"
@@ -179,6 +182,45 @@ int main() {
         for (int i = 0; i < 2000; i++) all_gone &= !db.get("key" + std::to_string(i)).has_value();
         check(all_gone, "deleting every key reads back as empty");
         check(sst_bytes(dir) < live, "and the deletions release the space rather than adding to it");
+    }
+
+    {
+        // Four readers against a tree that a writer and the worker are both
+        // changing underneath them. Every key holds the same value throughout,
+        // so any version a reader sees is the right one, and a missing key is
+        // not.
+        auto dir = fresh("threads");
+        NexusDB::Options opts;
+        opts.memtable_limit = 32 * 1024;
+        opts.base_level_bytes = 128 * 1024;
+        opts.target_file_bytes = 64 * 1024;
+        NexusDB db(dir, opts);
+
+        const std::string value(80, 'v');
+        const int keys = 5000;
+        for (int i = 0; i < keys; i++) db.put("key" + std::to_string(i), value);
+
+        std::atomic<bool> stop{false};
+        std::atomic<int> wrong{0};
+        std::atomic<long> reads{0};
+        std::vector<std::thread> readers;
+        for (int t = 0; t < 4; t++) {
+            readers.emplace_back([&, t] {
+                std::mt19937 rng(static_cast<unsigned>(t) + 1);
+                while (!stop.load()) {
+                    auto value_read = db.get("key" + std::to_string(rng() % keys));
+                    if (!value_read || *value_read != value) wrong++;
+                    reads++;
+                }
+            });
+        }
+        for (int round = 0; round < 3; round++)
+            for (int i = 0; i < keys; i++) db.put("key" + std::to_string(i), value);
+        stop = true;
+        for (auto& reader : readers) reader.join();
+
+        check(wrong.load() == 0 && reads.load() > 0,
+              "reads stay correct while a writer and the compactor work underneath them");
     }
 
     {
