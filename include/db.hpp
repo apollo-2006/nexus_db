@@ -1,11 +1,13 @@
 #pragma once
-#include "memtable.hpp"
-#include "wal.hpp"
-#include <string>
-#include <optional>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <vector>
+
+#include "memtable.hpp"
+#include "sstable.hpp"
+#include "wal.hpp"
 
 class NexusDB {
 private:
@@ -13,7 +15,8 @@ private:
     std::unique_ptr<MemTable> active_memtable;
     std::unique_ptr<WriteAheadLog> wal;
 
-    std::vector<std::string> sst_files; // Tracks all flushed disk files
+    // Flushed files, oldest first. Each holds its own Bloom filter and index.
+    std::vector<std::shared_ptr<SSTableReader>> sst_readers;
     std::mutex db_mutex;
 
     size_t memtable_limit;               // flush threshold, 1MB by default
@@ -35,12 +38,13 @@ public:
     void remove(const std::string& key);
 
     // Where a read was answered from, for the dashboard and the web demo.
-    // source is -1 for the memtable, the SSTable's position in the newest-first
-    // search for a disk hit, and -2 for a miss. sstables_checked counts files opened.
+    // source is -1 for the memtable, the file's position in the newest-first
+    // search for a disk hit, and -2 for a miss.
     struct ReadTrace {
         std::optional<std::string> value;
         int source = -2;
-        int sstables_checked = 0;
+        int sstables_checked = 0;  // files opened and scanned
+        int sstables_skipped = 0;  // files ruled out by their key range or Bloom filter
         bool tombstone = false;
     };
     ReadTrace get_traced(const std::string& key);

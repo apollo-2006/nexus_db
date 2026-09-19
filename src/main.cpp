@@ -103,7 +103,11 @@ int main(int argc, char** argv) {
     time_reads("recent key (memtable)", [&] { return keys[recent(rng)]; }, true);
     time_reads("random existing key", [&] { return keys[any(rng)]; }, true);
     time_reads("oldest key", [&] { return keys[0]; }, true);
-    time_reads("missing key", [&] { return std::string("nope_") + std::to_string(rng()); }, false);
+    // Two kinds of miss. A key outside every file's range is ruled out by the
+    // range check alone; one that sorts between real keys is what the Bloom
+    // filters actually have to answer, so both are worth separating.
+    time_reads("missing, outside range", [&] { return std::string("nope_") + std::to_string(rng()); }, false);
+    time_reads("missing, inside range", [&] { return keys[any(rng)] + "_absent"; }, false);
 
     return 0;
 }

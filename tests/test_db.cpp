@@ -11,6 +11,7 @@
 #include <fstream>
 #include <string>
 
+#include "../include/bloom.hpp"
 #include "../include/db.hpp"
 
 namespace fs = std::filesystem;
@@ -43,6 +44,30 @@ static void crash_after(const std::string& dir, int n, size_t limit) {
 
 int main() {
     {
+        // The filter may say maybe about a key it has never seen, which costs a
+        // wasted seek, but it may never say no about one it holds, which would
+        // lose data.
+        std::vector<std::string> keys;
+        for (int i = 0; i < 10000; i++) keys.push_back("user_" + std::to_string(i));
+        const BloomFilter filter = BloomFilter::build(keys);
+
+        bool all_present = true;
+        for (const auto& key : keys) all_present &= filter.maybe_contains(key);
+        check(all_present, "every key that was added reads back as maybe present");
+
+        int false_positives = 0;
+        for (int i = 0; i < 100000; i++)
+            if (filter.maybe_contains("absent_" + std::to_string(i))) false_positives++;
+        // Ten bits per key puts the theoretical rate near 1%. The bound here is
+        // loose enough to survive a different key distribution and tight enough
+        // that a broken hash, which would drive it toward 100%, fails.
+        check(false_positives < 3000, "fewer than 3% of absent keys are false positives");
+
+        check(!BloomFilter::build({}).maybe_contains("anything"),
+              "a filter built from no keys rules out every key");
+    }
+
+    {
         auto dir = fresh("basic");
         NexusDB db(dir);
         db.put("a", "1");
@@ -65,8 +90,14 @@ int main() {
             db.put("k6", "newest");
             check(db.sstable_count() >= 10, "a small memtable limit flushes many SSTables");
             auto t = db.get_traced("k0");
-            check(t.value && t.source > 0 && t.sstables_checked == t.source + 1,
+            check(t.value && t.source > 0 && t.sstables_checked + t.sstables_skipped == t.source + 1,
                   "an old key is found in an older SSTable, newest searched first");
+            check(t.sstables_skipped > 0 && t.sstables_checked <= 2,
+                  "the files that cannot hold it are skipped rather than read");
+
+            auto miss = db.get_traced("k99999");
+            check(!miss.value && miss.sstables_checked <= 1,
+                  "a missing key is ruled out of nearly every file without a read");
         }
         NexusDB db(dir, 4096);
         check(db.get("k1999") == std::optional<std::string>(std::string(40, 'x')), "reopen re-adopts SSTables");

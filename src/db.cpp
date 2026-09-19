@@ -37,15 +37,21 @@ NexusDB::NexusDB(const std::string& directory, size_t limit)
         }
     }
 
-    // Oldest first, so that get()'s reverse walk still sees newest first.
+    // Oldest first, so that get()'s reverse walk still sees newest first. Opening
+    // a file reads its index and Bloom filter into memory; the records stay on disk.
     std::sort(found.begin(), found.end());
     for (const auto& [index, path] : found) {
-        sst_files.push_back(path);
+        auto reader = std::make_shared<SSTableReader>(path);
+        if (!reader->ok()) {
+            std::cerr << "[NexusDB] Ignoring " << path << ": not an SSTable this build can read\n";
+            continue;
+        }
+        sst_readers.push_back(std::move(reader));
         sst_counter = std::max(sst_counter, index + 1);
     }
 
-    if (!sst_files.empty()) {
-        std::cout << "[NexusDB] Recovered " << sst_files.size()
+    if (!sst_readers.empty()) {
+        std::cout << "[NexusDB] Recovered " << sst_readers.size()
                   << " SSTable(s) from " << db_dir << "\n";
     }
 
@@ -136,7 +142,7 @@ void NexusDB::flush_memtable() {
 
     std::string sst_path = db_dir + "/data_" + std::to_string(sst_counter++) + ".sst";
 
-    if (!SSTable::write(sst_path, active_memtable->entries())) {
+    if (!SSTableWriter::write(sst_path, active_memtable->entries())) {
         // Keep the memtable and the WAL. Clearing the log after a failed write
         // would drop every record in this memtable with nothing left holding it.
         std::cerr << "[NexusDB] Flush to " << sst_path << " failed; keeping memtable\n";
@@ -145,7 +151,17 @@ void NexusDB::flush_memtable() {
         return;
     }
 
-    sst_files.push_back(sst_path);
+    auto reader = std::make_shared<SSTableReader>(sst_path);
+    if (!reader->ok()) {
+        // The file was written and then could not be read back. Keeping the
+        // memtable is the only safe answer: those records are still held only in
+        // RAM and in the log.
+        std::cerr << "[NexusDB] Wrote " << sst_path << " but cannot read it back; keeping memtable\n";
+        std::filesystem::remove(sst_path);
+        --sst_counter;
+        return;
+    }
+    sst_readers.push_back(std::move(reader));
 
     // Reset RAM and WAL
     active_memtable = std::make_unique<MemTable>();
@@ -177,11 +193,17 @@ NexusDB::ReadTrace NexusDB::get_traced_locked(const std::string& key) {
         return trace;
     }
 
-    // 2. Then the SSTables, newest first, for the same reason.
+    // 2. Then the SSTables, newest first, for the same reason. A file whose key
+    //    range or Bloom filter rules the key out is never opened, which is what
+    //    keeps a miss from costing a pass over every file on disk.
     int position = 0;
-    for (auto it = sst_files.rbegin(); it != sst_files.rend(); ++it, ++position) {
+    for (auto it = sst_readers.rbegin(); it != sst_readers.rend(); ++it, ++position) {
+        if (!(*it)->may_hold(key)) {
+            trace.sstables_skipped++;
+            continue;
+        }
         trace.sstables_checked++;
-        if (auto record = SSTable::search(*it, key)) {
+        if (auto record = (*it)->get(key)) {
             trace.source = position;
             trace.tombstone = record->tombstone;
             if (!record->tombstone) trace.value = std::move(record->value);
@@ -194,7 +216,7 @@ NexusDB::ReadTrace NexusDB::get_traced_locked(const std::string& key) {
 
 size_t NexusDB::sstable_count() {
     std::lock_guard<std::mutex> lock(db_mutex);
-    return sst_files.size();
+    return sst_readers.size();
 }
 
 size_t NexusDB::memtable_bytes() {
