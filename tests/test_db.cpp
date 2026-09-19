@@ -28,6 +28,34 @@ static std::string fresh(const char* name) {
     return dir;
 }
 
+// Logs are numbered, and several can exist at once: one per memtable that has
+// not been flushed yet.
+static std::vector<fs::path> wal_files(const std::string& dir) {
+    std::vector<std::pair<unsigned long long, fs::path>> found;
+    for (const auto& e : fs::directory_iterator(dir)) {
+        const std::string name = e.path().filename().string();
+        if (name.rfind("wal_", 0) != 0 || e.path().extension() != ".log") continue;
+        found.emplace_back(std::stoull(name.substr(4)), e.path());
+    }
+    std::sort(found.begin(), found.end());
+    std::vector<fs::path> paths;
+    for (auto& [seq, path] : found) paths.push_back(path);
+    return paths;
+}
+
+static uintmax_t wal_bytes(const std::string& dir) {
+    uintmax_t total = 0;
+    for (const auto& path : wal_files(dir)) total += fs::file_size(path);
+    return total;
+}
+
+static uintmax_t sst_bytes(const std::string& dir) {
+    uintmax_t total = 0;
+    for (const auto& e : fs::directory_iterator(dir))
+        if (e.path().extension() == ".sst") total += e.file_size();
+    return total;
+}
+
 static void crash_after(const std::string& dir, int n, size_t limit) {
     std::fflush(stdout);
     pid_t pid = fork();
@@ -82,27 +110,93 @@ int main() {
     }
 
     {
+        // Level 0 only, so the read path can be watched with every flush still
+        // sitting where it landed.
+        auto dir = fresh("level0");
+        NexusDB::Options opts;
+        opts.memtable_limit = 4096;
+        opts.background = false;
+        opts.l0_compaction_trigger = 1000;  // no compaction in this test
+        NexusDB db(dir, opts);
+        for (int i = 0; i < 2000; i++) db.put("k" + std::to_string(i), std::string(40, 'x'));
+
+        check(db.sstable_count() >= 10 && db.files_in_level(0) == db.sstable_count(),
+              "a small memtable limit flushes many files, all into level 0");
+
+        auto t = db.get_traced("k0");
+        check(t.value && t.source > 0, "an old key is found below the newer files");
+        check(t.sstables_skipped > 0 && t.sstables_checked <= 2,
+              "the files that cannot hold it are skipped rather than read");
+
+        auto miss = db.get_traced("k99999");
+        check(!miss.value && miss.sstables_checked <= 1,
+              "a missing key is ruled out of nearly every file without a read");
+    }
+
+    {
         auto dir = fresh("flush");
         {
             NexusDB db(dir, 4096);
             for (int i = 0; i < 2000; i++) db.put("k" + std::to_string(i), std::string(40, 'x'));
             db.remove("k5");
             db.put("k6", "newest");
-            check(db.sstable_count() >= 10, "a small memtable limit flushes many SSTables");
-            auto t = db.get_traced("k0");
-            check(t.value && t.source > 0 && t.sstables_checked + t.sstables_skipped == t.source + 1,
-                  "an old key is found in an older SSTable, newest searched first");
-            check(t.sstables_skipped > 0 && t.sstables_checked <= 2,
-                  "the files that cannot hold it are skipped rather than read");
-
-            auto miss = db.get_traced("k99999");
-            check(!miss.value && miss.sstables_checked <= 1,
-                  "a missing key is ruled out of nearly every file without a read");
+            db.wait_for_background();
+            check(db.flush_count() >= 10, "a small memtable limit flushes many times");
+            check(db.compaction_count() > 0 && db.sstable_count() < db.flush_count(),
+                  "compaction merges those flushes into fewer files");
+            check(db.level_count() > 1 && db.files_in_level(1) > 0, "and moves them off level 0");
+            check(db.get("k0") == std::optional<std::string>(std::string(40, 'x')),
+                  "an old key survives the merge");
         }
         NexusDB db(dir, 4096);
         check(db.get("k1999") == std::optional<std::string>(std::string(40, 'x')), "reopen re-adopts SSTables");
-        check(!db.get("k5").has_value(), "a tombstone in a newer SSTable hides the older value");
+        check(!db.get("k5").has_value(), "a tombstone still hides the older value after reopening");
         check(db.get("k6") == std::optional<std::string>("newest"), "the newest value wins across files");
+    }
+
+    {
+        // Every key rewritten five times. Without compaction all six versions
+        // stay on disk; with it only the newest survives the merge.
+        auto dir = fresh("space");
+        NexusDB::Options opts;
+        opts.memtable_limit = 16 * 1024;
+        opts.base_level_bytes = 64 * 1024;
+        opts.target_file_bytes = 32 * 1024;
+        NexusDB db(dir, opts);
+
+        const std::string value(60, 'v');
+        for (int round = 0; round < 6; round++)
+            for (int i = 0; i < 2000; i++) db.put("key" + std::to_string(i), value);
+        db.wait_for_background();
+
+        const uintmax_t live = 2000 * (value.size() + 8);
+        check(sst_bytes(dir) < 3 * live, "rewritten keys do not keep six copies on disk");
+        check(db.get("key1999") == std::optional<std::string>(value), "and the newest version is the one that is read");
+
+        for (int i = 0; i < 2000; i++) db.remove("key" + std::to_string(i));
+        db.wait_for_background();
+        bool all_gone = true;
+        for (int i = 0; i < 2000; i++) all_gone &= !db.get("key" + std::to_string(i)).has_value();
+        check(all_gone, "deleting every key reads back as empty");
+        check(sst_bytes(dir) < live, "and the deletions release the space rather than adding to it");
+    }
+
+    {
+        // What a crash during a compaction leaves: outputs on disk that the
+        // manifest does not name, and the inputs it does name still in place.
+        auto dir = fresh("orphan");
+        {
+            NexusDB db(dir, 4096);
+            for (int i = 0; i < 500; i++) db.put("k" + std::to_string(i), "v" + std::to_string(i));
+            db.wait_for_background();
+        }
+        const uintmax_t before = sst_bytes(dir);
+        { std::ofstream f(dir + "/data_99999.sst", std::ios::binary); f << std::string(4096, 'x'); }
+
+        NexusDB db(dir, 4096);
+        check(!fs::exists(dir + "/data_99999.sst"), "a file the manifest does not name is removed at open");
+        check(sst_bytes(dir) == before, "and nothing it does name is touched");
+        check(db.get("k499") == std::optional<std::string>("v499"), "the data is intact");
     }
 
     {
@@ -138,7 +232,7 @@ int main() {
     {
         auto dir = fresh("crash");
         crash_after(dir, 50, NexusDB::DEFAULT_MEMTABLE_LIMIT);
-        check(fs::exists(dir + "/active.wal") && fs::file_size(dir + "/active.wal") > 0, "the crashed process left a WAL behind");
+        check(wal_bytes(dir) > 0, "the crashed process left a WAL behind");
         NexusDB db(dir);
         check(db.wal_records_replayed() == 51, "all 50 puts and the delete are replayed");
         check(db.get("k49") == std::optional<std::string>("v49"), "a write that was never flushed survives the crash");
@@ -157,7 +251,7 @@ int main() {
     {
         auto dir = fresh("torn");
         crash_after(dir, 10, NexusDB::DEFAULT_MEMTABLE_LIMIT);
-        const auto wal = dir + "/active.wal";
+        const auto wal = wal_files(dir).back();
         const auto whole = fs::file_size(wal);
         fs::resize_file(wal, whole - 3);  // the last record is cut mid-value
         {
@@ -176,9 +270,9 @@ int main() {
     {
         auto dir = fresh("garbage");
         fs::create_directories(dir);
-        { std::ofstream f(dir + "/active.wal", std::ios::binary); f << "\xff\xff\xff\xff\xff\xff\xff\x7f garbage"; }
+        { std::ofstream f(dir + "/wal_0.log", std::ios::binary); f << "\xff\xff\xff\xff\xff\xff\xff\x7f garbage"; }
         NexusDB db(dir);
-        check(db.wal_records_replayed() == 0 && fs::file_size(dir + "/active.wal") == 0,
+        check(db.wal_records_replayed() == 0 && fs::file_size(dir + "/wal_0.log") == 0,
               "a corrupt length is not allocated; the log is truncated to its last good record");
     }
 

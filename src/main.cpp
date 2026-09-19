@@ -64,6 +64,12 @@ int main(int argc, char** argv) {
     for (int i = 0; i < num_writes; i++) db.put(keys[i], values[i]);
     const double write_ms = us_since(t0) / 1000.0;
 
+    // Flushes and compactions run on a worker thread, so the write loop can
+    // finish with work still queued. Reads are measured against a settled tree.
+    const auto settle = Clock::now();
+    db.wait_for_background();
+    const double settle_ms = us_since(settle) / 1000.0;
+
     size_t sst_count = 0, sst_bytes = 0;
     for (const auto& e : std::filesystem::directory_iterator(dir)) {
         if (e.path().extension() == ".sst") {
@@ -72,9 +78,20 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("writes: %d in %.0f ms (%.0f ops/s), %zu SSTables, %.1f MB on disk\n",
-                num_writes, write_ms, num_writes / (write_ms / 1000.0), sst_count,
-                sst_bytes / 1e6);
+    std::printf("writes: %d in %.0f ms (%.0f ops/s), then %.0f ms to settle\n",
+                num_writes, write_ms, num_writes / (write_ms / 1000.0), settle_ms);
+    uint64_t user_bytes = 0;
+    for (int i = 0; i < num_writes; i++) user_bytes += keys[i].size() + values[i].size();
+    std::printf("tree:   %zu SSTables, %.1f MB on disk, %zu flushes, %zu compactions\n",
+                sst_count, sst_bytes / 1e6, db.flush_count(), db.compaction_count());
+    std::printf("wrote:  %.1f MB flushed + %.1f MB compacted for %.1f MB of keys and values"
+                " (%.1fx amplification)\n",
+                db.flushed_bytes() / 1e6, db.compacted_bytes() / 1e6, user_bytes / 1e6,
+                static_cast<double>(db.flushed_bytes() + db.compacted_bytes()) / static_cast<double>(user_bytes));
+    for (int level = 0; level < db.level_count(); level++) {
+        std::printf("          L%d: %2zu files, %6.1f MB\n", level, db.files_in_level(level),
+                    db.bytes_in_level(level) / 1e6);
+    }
 
     // The last few thousand writes are still in the memtable; the first ones are
     // in the oldest SSTable, which a newest-first read reaches last.

@@ -17,8 +17,9 @@
 // Layout, little-endian throughout:
 //
 //     magic         "NXSSTBL"   7 bytes
-//     version       u8          3
+//     version       u8          4
 //     count         u64         records in the file
+//     tombstones    u64         how many of them are deletions
 //     index_offset  u64
 //     bloom_offset  u64
 //     bloom_bits    u64
@@ -34,8 +35,8 @@
 namespace sst {
 
 inline constexpr char MAGIC[7] = {'N', 'X', 'S', 'S', 'T', 'B', 'L'};
-inline constexpr uint8_t VERSION = 3;
-inline constexpr size_t HEADER_BYTES = sizeof(MAGIC) + 1 + 8 * 4 + 4 * 2;
+inline constexpr uint8_t VERSION = 4;
+inline constexpr size_t HEADER_BYTES = sizeof(MAGIC) + 1 + 8 * 5 + 4 * 2;
 inline constexpr uint32_t DEFAULT_INDEX_STRIDE = 16;
 
 }  // namespace sst
@@ -50,8 +51,10 @@ public:
         if (!out) return false;
 
         // Header first with the offsets left blank: they are only known once the
-        // records are down, and rewriting eight bytes beats buffering the file.
-        write_header(out, records.size(), 0, 0, 0, 0, index_stride);
+        // records are down, and rewriting a few bytes beats buffering the file.
+        write_header(out, records.size(), 0, 0, 0, 0, 0, index_stride);
+
+        uint64_t tombstones = 0;
 
         std::vector<std::pair<std::string, uint64_t>> index;
         std::vector<std::string> keys;
@@ -63,6 +66,7 @@ public:
             // carries the key range of the file.
             if (i % index_stride == 0 || i + 1 == records.size()) index.emplace_back(records[i].key, offset);
 
+            if (records[i].tombstone) tombstones++;
             put_u8(out, records[i].tombstone ? RECORD_TOMBSTONE : 0);
             put_bytes(out, records[i].key);
             put_bytes(out, records[i].value);
@@ -82,7 +86,7 @@ public:
                   static_cast<std::streamsize>(bloom.bytes().size()));
 
         out.seekp(0, std::ios::beg);
-        write_header(out, records.size(), index_offset, bloom_offset, bloom.bit_count(),
+        write_header(out, records.size(), tombstones, index_offset, bloom_offset, bloom.bit_count(),
                      bloom.hash_count(), index_stride);
 
         out.close();
@@ -90,11 +94,13 @@ public:
     }
 
 private:
-    static void write_header(std::ostream& out, uint64_t count, uint64_t index_offset, uint64_t bloom_offset,
-                             uint64_t bloom_bits, uint32_t bloom_hashes, uint32_t index_stride) {
+    static void write_header(std::ostream& out, uint64_t count, uint64_t tombstones, uint64_t index_offset,
+                             uint64_t bloom_offset, uint64_t bloom_bits, uint32_t bloom_hashes,
+                             uint32_t index_stride) {
         out.write(sst::MAGIC, sizeof(sst::MAGIC));
         put_u8(out, sst::VERSION);
         put_u64(out, count);
+        put_u64(out, tombstones);
         put_u64(out, index_offset);
         put_u64(out, bloom_offset);
         put_u64(out, bloom_bits);
@@ -112,6 +118,10 @@ public:
     bool ok() const { return ok_; }
     const std::string& path() const { return path_; }
     uint64_t record_count() const { return count_; }
+    // How many of those records are deletions. A level thick with them is worth
+    // compacting even when its size is within budget: the space they hold down
+    // is only released once they meet the values they delete.
+    uint64_t tombstone_count() const { return tombstones_; }
     uint64_t file_bytes() const { return file_size_; }
     // Both empty when the file holds no records.
     const std::string& min_key() const { return min_key_; }
@@ -200,7 +210,7 @@ private:
 
         uint64_t bloom_offset = 0, bloom_bits = 0;
         uint32_t bloom_hashes = 0, stride = 0;
-        if (!get_u64(in, count_) || !get_u64(in, index_offset_) || !get_u64(in, bloom_offset) ||
+        if (!get_u64(in, count_) || !get_u64(in, tombstones_) || !get_u64(in, index_offset_) || !get_u64(in, bloom_offset) ||
             !get_u64(in, bloom_bits) || !get_u32(in, bloom_hashes) || !get_u32(in, stride))
             return;
         if (index_offset_ > file_size_ || bloom_offset > file_size_) return;
@@ -249,6 +259,7 @@ private:
     std::string path_;
     bool ok_ = false;
     uint64_t count_ = 0;
+    uint64_t tombstones_ = 0;
     uint64_t file_size_ = 0;
     uint64_t index_offset_ = 0;
     std::vector<std::pair<std::string, uint64_t>> index_;
