@@ -75,6 +75,36 @@ int main() {
     }
 
     {
+        // The engine used to store deletions as the literal value "@@TOMBSTONE@@",
+        // so writing that string deleted the key instead of storing it.
+        auto dir = fresh("tombstone_value");
+        const std::string looks_like_a_tombstone = "@@TOMBSTONE@@";
+        {
+            NexusDB db(dir, 4096);
+            db.put("marker", looks_like_a_tombstone);
+            db.put("padding", std::string(8192, 'x'));  // forces a flush
+            check(db.get("marker") == std::optional<std::string>(looks_like_a_tombstone),
+                  "a value that looks like a tombstone is still a value");
+        }
+        NexusDB db(dir, 4096);
+        check(db.get("marker") == std::optional<std::string>(looks_like_a_tombstone),
+              "and it survives a flush and reopen");
+
+        auto t = db.get_traced("marker");
+        check(t.value.has_value() && !t.tombstone, "the read is not reported as a deletion");
+    }
+
+    {
+        auto dir = fresh("foreign_sst");
+        fs::create_directories(dir);
+        { std::ofstream f(dir + "/data_0.sst", std::ios::binary); f << "not an sstable at all"; }
+        NexusDB db(dir);
+        db.put("k", "v");
+        check(db.get("k") == std::optional<std::string>("v") && !db.get("other").has_value(),
+              "a file that is not an SSTable is not parsed as one");
+    }
+
+    {
         auto dir = fresh("crash");
         crash_after(dir, 50, NexusDB::DEFAULT_MEMTABLE_LIMIT);
         check(fs::exists(dir + "/active.wal") && fs::file_size(dir + "/active.wal") > 0, "the crashed process left a WAL behind");

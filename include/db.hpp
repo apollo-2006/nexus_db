@@ -22,6 +22,7 @@ private:
 
     void flush_memtable();
     size_t replay_wal(const std::string& path);
+    void write(const std::string& key, const std::string& value, bool tombstone);
 
 public:
     static constexpr size_t DEFAULT_MEMTABLE_LIMIT = 1024 * 1024;
