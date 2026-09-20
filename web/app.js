@@ -13,33 +13,51 @@ function log(text, cls = '') {
   while (el.children.length > 60) el.lastChild.remove();
 }
 
+// The tree the engine reports, plus the logs and the manifest, which are files
+// on the same filesystem but not part of any level.
 function files() {
+  const out = JSON.parse(api.tree()).map((f) => ({ ...f, size: f.bytes }));
+  out.sort((a, b) => a.level - b.level || b.name.localeCompare(a.name, undefined, { numeric: true }));
+
   let names = [];
-  try { names = M.FS.readdir(DIR).filter((n) => n !== '.' && n !== '..'); } catch { return []; }
-  const sst = names.filter((n) => /^data_\d+\.sst$/.test(n)).sort((a, b) => parseInt(b.slice(5)) - parseInt(a.slice(5)));
-  const out = sst.map((n) => ({ name: n, size: M.FS.stat(`${DIR}/${n}`).size }));
-  if (names.includes('active.wal')) out.unshift({ name: 'active.wal', size: M.FS.stat(`${DIR}/active.wal`).size, wal: true });
+  try { names = M.FS.readdir(DIR).filter((n) => n !== '.' && n !== '..'); } catch { return out; }
+  const logs = names.filter((n) => /^wal_\d+\.log$/.test(n)).sort((a, b) => parseInt(a.slice(4)) - parseInt(b.slice(4)));
+  for (const name of logs.reverse()) out.unshift({ name, size: M.FS.stat(`${DIR}/${name}`).size, wal: true, level: -1 });
   return out;
 }
 
-// [key_len][key][value_len][value], lengths as size_t: 4 bytes on wasm32.
+// Records are [flags][key_len][key][value_len][value], lengths little-endian
+// u32. A log starts at byte zero; an SSTable starts after its header and ends
+// where its index begins, with the Bloom filter after that.
+const SST_HEADER = 7 + 1 + 8 * 5 + 4 * 2;
+
 function decode(name, max = 400) {
   const bytes = M.FS.readFile(`${DIR}/${name}`);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const text = new TextDecoder();
+  const log = /^wal_/.test(name);
+
+  let off = 0, end = bytes.length;
+  if (!log) {
+    if (bytes.length < SST_HEADER) return { rows: [], count: 0, torn: false };
+    off = SST_HEADER;
+    end = Number(view.getBigUint64(7 + 1 + 8 * 2, true));  // index_offset
+  }
+
   const rows = [];
-  let off = 0, count = 0;
-  while (off + 4 <= bytes.length) {
+  let count = 0;
+  while (off + 5 <= end) {
+    const flags = view.getUint8(off); off += 1;
     const kl = view.getUint32(off, true); off += 4;
-    if (off + kl + 4 > bytes.length) break;
+    if (off + kl + 4 > end) break;
     const key = text.decode(bytes.subarray(off, off + kl)); off += kl;
     const vl = view.getUint32(off, true); off += 4;
-    if (off + vl > bytes.length) break;
+    if (off + vl > end) break;
     const value = text.decode(bytes.subarray(off, off + vl)); off += vl;
     count++;
-    if (rows.length < max) rows.push([key, value]);
+    if (rows.length < max) rows.push([key, value, (flags & 1) !== 0]);
   }
-  return { rows, count, torn: off < bytes.length };
+  return { rows, count, torn: off < end };
 }
 
 const fmt = (n) => (n >= 1024 ? (n / 1024).toFixed(1) + ' KB' : n + ' B');
@@ -50,18 +68,28 @@ function draw() {
   $('memText').textContent = `${fmt(bytes)} of ${fmt(limit)}`;
   const list = files();
   const ul = $('files'); ul.textContent = '';
-  let total = 0;
+  let total = 0, sstables = 0, shown = -2;
   for (const f of list) {
-    total += f.size;
+    if (!f.wal) { total += f.size; sstables++; }
+    if (f.level !== shown) {
+      shown = f.level;
+      const head = document.createElement('li');
+      head.className = 'levelhead muted';
+      head.textContent = f.wal ? 'write-ahead logs' : `level ${f.level}${f.level === 0 ? ' (files overlap, newest first)' : ' (disjoint key ranges)'}`;
+      ul.append(head);
+    }
     const li = document.createElement('li');
     li.className = (f.wal ? 'wal ' : '') + (f.name === selectedFile ? 'sel ' : '') + (f.name === lastHitFile ? 'hit' : '');
     li.innerHTML = `<span></span><span class="muted"></span>`;
-    li.firstChild.textContent = f.wal ? 'active.wal (log)' : f.name;
-    li.lastChild.textContent = fmt(f.size);
+    li.firstChild.textContent = f.wal ? `${f.name} (log)` : f.name;
+    li.lastChild.textContent = f.wal ? fmt(f.size) : `${fmt(f.size)}${f.tombstones ? `, ${f.tombstones} deleted` : ''}`;
     li.onclick = () => { selectedFile = f.name; inspect(); draw(); };
     ul.append(li);
   }
-  $('diskTotal').textContent = list.length ? `(${list.length - (list[0]?.wal ? 1 : 0)} SSTables, ${fmt(total)})` : '';
+  const compactions = api.compactions();
+  $('diskTotal').textContent = sstables
+    ? `(${sstables} SSTable${sstables === 1 ? '' : 's'}, ${fmt(total)}, ${api.flushes()} flush${api.flushes() === 1 ? '' : 'es'}, ${compactions} compaction${compactions === 1 ? '' : 's'})`
+    : '';
   if (selectedFile && !list.some((f) => f.name === selectedFile)) { selectedFile = null; inspect(); }
 }
 
@@ -69,18 +97,19 @@ function inspect() {
   const body = $('insp'); body.textContent = '';
   if (!selectedFile) { $('inspName').textContent = 'a file'; $('inspNote').textContent = ''; return; }
   const { rows, count, torn } = decode(selectedFile);
+  const meta = files().find((f) => f.name === selectedFile) || {};
   $('inspName').textContent = selectedFile;
-  $('inspNote').textContent = selectedFile === 'active.wal'
-    ? `${count} records in arrival order, including overwrites and deletes. Replayed into the memtable on open, truncated on flush.`
-    : `${count} records, sorted by key, never modified after this file was written.${count > rows.length ? ` Showing the first ${rows.length}.` : ''}`;
+  $('inspNote').textContent = /^wal_/.test(selectedFile)
+    ? `${count} records in arrival order, including overwrites and deletes. Replayed into the memtable on open, and deleted once a flush has written its records into a file.`
+    : `${count} records at level ${meta.level}, sorted by key, never modified after this file was written. Keys ${meta.min} to ${meta.max}.${count > rows.length ? ` Showing the first ${rows.length}.` : ''}`;
   if (torn) $('inspNote').textContent += ' The file ends in a partial record.';
-  rows.forEach(([k, v], i) => {
+  rows.forEach(([k, v, tombstone], i) => {
     const tr = document.createElement('tr');
     tr.innerHTML = '<td class="muted"></td><td></td><td></td>';
     tr.children[0].textContent = i;
     tr.children[1].textContent = k;
-    tr.children[2].textContent = v === '@@TOMBSTONE@@' ? '@@TOMBSTONE@@ (delete)' : v;
-    if (v === '@@TOMBSTONE@@') tr.children[2].className = 'err';
+    tr.children[2].textContent = tombstone ? 'deleted (tombstone flag)' : v;
+    if (tombstone) tr.children[2].className = 'err';
     body.append(tr);
   });
 }
@@ -111,6 +140,12 @@ NexusDB({ print: (t) => log(t.replace(/^\[NexusDB\] /, ''), 'muted'), printErr: 
     source: m.cwrap('db_last_source', 'number', []),
     checked: m.cwrap('db_last_checked', 'number', []),
     tomb: m.cwrap('db_last_tombstone', 'number', []),
+    file: m.cwrap('db_last_file', 'string', []),
+    level: m.cwrap('db_last_level', 'number', []),
+    skipped: m.cwrap('db_last_skipped', 'number', []),
+    tree: m.cwrap('db_tree_json', 'string', []),
+    flushes: m.cwrap('db_flushes', 'number', []),
+    compactions: m.cwrap('db_compactions', 'number', []),
     memtable: m.cwrap('db_memtable_bytes', 'number', []),
     replayed: m.cwrap('db_replayed', 'number', []),
   };
@@ -131,20 +166,25 @@ NexusDB({ print: (t) => log(t.replace(/^\[NexusDB\] /, ''), 'muted'), printErr: 
 
   $('get').onclick = () => {
     const key = $('rk').value;
-    const found = api.get(key), source = api.source(), checked = api.checked(), tomb = api.tomb();
-    const sst = files().filter((f) => !f.wal);
-    const where = source === -1 ? 'the memtable' : source >= 0 ? sst[source]?.name : null;
-    lastHitFile = source >= 0 ? sst[source]?.name : null;
+    const found = api.get(key), source = api.source(), tomb = api.tomb();
+    const checked = api.checked(), skipped = api.skipped();
+    const where = source === -1 ? 'the memtable' : `${api.file()} at level ${api.level()}`;
+    lastHitFile = source >= 0 ? api.file() : null;
+
+    // What the search cost: files it opened, and files the key range or the
+    // Bloom filter ruled out before it had to.
+    const opened = `${checked} file${checked === 1 ? '' : 's'} opened`;
+    const ruled = skipped ? `, ${skipped} ruled out by range or Bloom filter` : '';
     const el = $('trace');
     if (found) {
       el.className = 'trace ok';
-      el.textContent = `${key} = ${api.value()}\nfound in ${where}${source >= 0 ? `, after opening ${checked} SSTable${checked === 1 ? '' : 's'}` : ', no files opened'}`;
+      el.textContent = `${key} = ${api.value()}\nfound in ${where}\n${source >= 0 ? `${opened}${ruled}` : 'no files opened'}`;
     } else if (tomb) {
       el.className = 'trace err';
-      el.textContent = `${key}: deleted\na tombstone in ${where} stopped the search${source >= 0 ? ` after ${checked} SSTable${checked === 1 ? '' : 's'}` : ''}`;
+      el.textContent = `${key}: deleted\na tombstone in ${where} stopped the search\n${source >= 0 ? `${opened}${ruled}` : 'no files opened'}`;
     } else {
       el.className = 'trace err';
-      el.textContent = `${key}: not found\nchecked the memtable and all ${checked} SSTable${checked === 1 ? '' : 's'}`;
+      el.textContent = `${key}: not found\n${opened}${ruled}`;
     }
     draw();
   };
@@ -174,7 +214,7 @@ NexusDB({ print: (t) => log(t.replace(/^\[NexusDB\] /, ''), 'muted'), printErr: 
       ['read: recent key (memtable)', ms(r(2))],
       ['read: random existing key', ms(r(3))],
       ['read: oldest key (last file)', ms(r(4))],
-      ['read: missing key (every file)', ms(r(5))],
+      ['read: missing key', ms(r(5))],
     ].map(([a, b]) => `<tr><td>${a}</td><td>${b}</td></tr>`).join('');
   };
 });

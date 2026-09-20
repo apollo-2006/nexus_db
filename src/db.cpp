@@ -745,6 +745,19 @@ size_t NexusDB::files_in_level(int level) {
     return levels_[static_cast<size_t>(level)].size();
 }
 
+std::vector<NexusDB::FileInfo> NexusDB::files() {
+    std::shared_lock<std::shared_mutex> lock(mu_);
+    std::vector<FileInfo> out;
+    for (size_t level = 0; level < levels_.size(); level++) {
+        for (const auto& file : levels_[level]) {
+            out.push_back(FileInfo{fs::path(file->reader.path()).filename().string(), static_cast<int>(level),
+                                   file->reader.file_bytes(), file->reader.record_count(),
+                                   file->reader.tombstone_count(), file->reader.min_key(), file->reader.max_key()});
+        }
+    }
+    return out;
+}
+
 uint64_t NexusDB::bytes_in_level(int level) {
     std::shared_lock<std::shared_mutex> lock(mu_);
     if (level < 0 || level >= static_cast<int>(levels_.size())) return 0;

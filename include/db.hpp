@@ -88,6 +88,17 @@ public:
     size_t files_in_level(int level);
     uint64_t bytes_in_level(int level);
 
+    // The tree as it stands, level by level, for the dashboard and the demo.
+    struct FileInfo {
+        std::string name;
+        int level = 0;
+        uint64_t bytes = 0;
+        uint64_t records = 0;
+        uint64_t tombstones = 0;
+        std::string min_key, max_key;
+    };
+    std::vector<FileInfo> files();
+
     // Blocks until the worker has nothing left to do. For tests, the benchmark
     // and the demo, which want to look at a settled tree.
     void wait_for_background();

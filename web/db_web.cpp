@@ -16,14 +16,25 @@ const char* DIR = "/db";
 NexusDB* db = nullptr;
 NexusDB::ReadTrace last;
 std::string last_value;
+std::string tree_json;
 double bench_results[6];
+
+// The page is single threaded: this build has no pthreads, so flushes and
+// compactions run on the calling thread rather than on a worker.
+NexusDB::Options page_options(int memtable_limit) {
+    NexusDB::Options options;
+    options.memtable_limit = static_cast<size_t>(memtable_limit);
+    options.background = false;
+    // Small enough that a few hundred keys typed into the page reach level 2.
+    options.base_level_bytes = static_cast<uint64_t>(memtable_limit) * 4;
+    options.target_file_bytes = static_cast<uint64_t>(memtable_limit) * 2;
+    return options;
+}
 }
 
 extern "C" {
 
-EMSCRIPTEN_KEEPALIVE void db_open(int memtable_limit) {
-    db = new NexusDB(DIR, static_cast<size_t>(memtable_limit));
-}
+EMSCRIPTEN_KEEPALIVE void db_open(int memtable_limit) { db = new NexusDB(DIR, page_options(memtable_limit)); }
 
 // A clean shutdown: the destructor flushes the memtable to an SSTable.
 EMSCRIPTEN_KEEPALIVE void db_close() {
@@ -56,7 +67,43 @@ EMSCRIPTEN_KEEPALIVE int db_last_source() { return last.source; }
 EMSCRIPTEN_KEEPALIVE int db_last_checked() { return last.sstables_checked; }
 EMSCRIPTEN_KEEPALIVE int db_last_tombstone() { return last.tombstone; }
 
+EMSCRIPTEN_KEEPALIVE const char* db_last_file() { return last.file.c_str(); }
+EMSCRIPTEN_KEEPALIVE int db_last_level() { return last.level; }
+EMSCRIPTEN_KEEPALIVE int db_last_skipped() { return last.sstables_skipped; }
+
 EMSCRIPTEN_KEEPALIVE int db_sstables() { return static_cast<int>(db->sstable_count()); }
+EMSCRIPTEN_KEEPALIVE int db_flushes() { return static_cast<int>(db->flush_count()); }
+EMSCRIPTEN_KEEPALIVE int db_compactions() { return static_cast<int>(db->compaction_count()); }
+
+// The tree, level by level, as JSON: the page draws the file panel from this
+// rather than guessing a level from a file name.
+EMSCRIPTEN_KEEPALIVE const char* db_tree_json() {
+    const auto quote = [](const std::string& text) {
+        std::string out = "\"";
+        for (char c : text) {
+            if (c == '"' || c == '\\') out += '\\';
+            if (static_cast<unsigned char>(c) < 0x20) {
+                out += ' ';
+                continue;
+            }
+            out += c;
+        }
+        return out + "\"";
+    };
+
+    tree_json = "[";
+    bool first = true;
+    for (const auto& file : db->files()) {
+        if (!first) tree_json += ",";
+        first = false;
+        tree_json += "{\"name\":" + quote(file.name) + ",\"level\":" + std::to_string(file.level) +
+                     ",\"bytes\":" + std::to_string(file.bytes) + ",\"records\":" + std::to_string(file.records) +
+                     ",\"tombstones\":" + std::to_string(file.tombstones) + ",\"min\":" + quote(file.min_key) +
+                     ",\"max\":" + quote(file.max_key) + "}";
+    }
+    tree_json += "]";
+    return tree_json.c_str();
+}
 EMSCRIPTEN_KEEPALIVE int db_memtable_bytes() { return static_cast<int>(db->memtable_bytes()); }
 EMSCRIPTEN_KEEPALIVE int db_replayed() { return static_cast<int>(db->wal_records_replayed()); }
 
@@ -74,7 +121,7 @@ EMSCRIPTEN_KEEPALIVE void bench_run(int writes, int reads) {
         keys.push_back("user_" + std::to_string(i));
         values.push_back("{\"name\": \"User" + std::to_string(i) + "\", \"tier\": \"premium\"}");
     }
-    NexusDB b(dir);
+    NexusDB b(dir, page_options(64 * 1024));
     auto t0 = Clock::now();
     for (int i = 0; i < writes; i++) b.put(keys[i], values[i]);
     bench_results[0] = us(t0) / 1000.0;

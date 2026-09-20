@@ -26,6 +26,8 @@
     .files li.sel { border-color: var(--accent-edge); background: var(--accent-soft); }
     .files li.hit { border-color: var(--ok); }
     .files li.wal { color: var(--accent-warm); }
+    .files li.levelhead { cursor: default; border: 0; padding: 10px 0 2px; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+    .files li.levelhead:hover { background: none; }
     .trace { font-family: var(--font-mono); font-size: 0.85rem; min-height: 3em; white-space: pre-wrap; overflow-wrap: anywhere; }
     .kv { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; }
     @media (max-width: 520px) { .kv { grid-template-columns: 1fr; } }
@@ -96,7 +98,7 @@
     <section class="panel">
       <h2>On disk <span class="muted mono" id="diskTotal"></span></h2>
       <ul class="files" id="files"></ul>
-      <p class="small muted" style="margin:8px 0 0">Newest first, the order a read searches them. Click a file to decode it.</p>
+      <p class="small muted" style="margin:8px 0 0">Level 0 is searched newest first; below it each level is disjoint, so at most one file per level can hold a key. Click a file to decode it.</p>
     </section>
 
     <section class="panel wide">
